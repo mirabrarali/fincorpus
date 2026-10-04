@@ -5,6 +5,38 @@ const stockSymbols: Record<string, string> = {
 
 const cacheHeaders = { "Cache-Control": "public, s-maxage=180, stale-while-revalidate=300" };
 
+function fallbackGoldQuote() {
+  return {
+    symbol: "XAU",
+    price: 7700,
+    currency: "INR",
+    unit: "10g",
+    updatedAt: new Date().toISOString(),
+    source: "fallback-estimate",
+    isFallback: true,
+  };
+}
+
+function fallbackStockQuote(symbol: string) {
+  const values: Record<string, { price: number; changePercent: number; annualizedVolatility: number; riskBand: string; riskSamples: number }> = {
+    RELIANCE: { price: 3035, changePercent: 1.2, annualizedVolatility: 18.4, riskBand: "moderate", riskSamples: 21 },
+    TCS: { price: 4018, changePercent: 0.7, annualizedVolatility: 14.8, riskBand: "lower", riskSamples: 21 },
+  };
+  const fallback = values[symbol] ?? { price: 1000, changePercent: 0.4, annualizedVolatility: 20, riskBand: "moderate", riskSamples: 12 };
+  return {
+    symbol,
+    price: fallback.price,
+    currency: "INR",
+    changePercent: fallback.changePercent,
+    annualizedVolatility: fallback.annualizedVolatility,
+    riskBand: fallback.riskBand,
+    riskSamples: fallback.riskSamples,
+    updatedAt: new Date().toISOString(),
+    source: "fallback-estimate",
+    isFallback: true,
+  };
+}
+
 export async function GET(request: Request) {
   const url = new URL(request.url);
   const type = url.searchParams.get("type");
@@ -30,7 +62,7 @@ export async function GET(request: Request) {
         source: "Gold-API.com + ExchangeRate-API",
       }, { headers: cacheHeaders });
     } catch {
-      return Response.json({ error: "Gold quote is temporarily unavailable." }, { status: 502 });
+      return Response.json(fallbackGoldQuote(), { headers: cacheHeaders });
     }
   }
 
@@ -38,7 +70,7 @@ export async function GET(request: Request) {
     const symbol = url.searchParams.get("symbol")?.toUpperCase() ?? "";
     if (!stockSymbols[symbol]) return Response.json({ error: "This stock symbol is not enabled." }, { status: 400 });
     const apiKey = process.env.TWELVE_DATA_API_KEY;
-    if (!apiKey) return Response.json({ error: "Add TWELVE_DATA_API_KEY to enable stock quotes." }, { status: 503 });
+    if (!apiKey) return Response.json(fallbackStockQuote(symbol), { headers: cacheHeaders });
     try {
       const quoteUrl = new URL("https://api.twelvedata.com/quote");
       quoteUrl.searchParams.set("symbol", stockSymbols[symbol]);
@@ -57,7 +89,7 @@ export async function GET(request: Request) {
       const [quote, history] = await Promise.all([response.json(), historyResponse.json()]);
       const price = Number(quote.price ?? quote.close);
       if (!response.ok || quote.status === "error" || !Number.isFinite(price)) {
-        return Response.json({ error: "The stock provider did not return a quote. Check symbol access and free-tier limits." }, { status: 502 });
+        return Response.json(fallbackStockQuote(symbol), { headers: cacheHeaders });
       }
       const changePercent = Number(quote.percent_change);
       const closes = Array.isArray(history.values)
@@ -81,7 +113,7 @@ export async function GET(request: Request) {
         source: "Twelve Data",
       }, { headers: cacheHeaders });
     } catch {
-      return Response.json({ error: "Stock quote is temporarily unavailable." }, { status: 502 });
+      return Response.json(fallbackStockQuote(symbol), { headers: cacheHeaders });
     }
   }
 
