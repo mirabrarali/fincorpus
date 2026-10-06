@@ -2,16 +2,16 @@
 
 import {
   ArrowUpRight,
-  BadgeIndianRupee,
-  BarChart3,
   Bell,
   BriefcaseBusiness,
   CalendarDays,
   Check,
   ChevronDown,
+  ChevronUp,
   CircleHelp,
-  Clock3,
   Coins,
+  FileText,
+  GripVertical,
   Landmark,
   LayoutDashboard,
   LockKeyhole,
@@ -19,6 +19,7 @@ import {
   Menu,
   MessageCircle,
   Plus,
+  Search,
   Send,
   ShieldCheck,
   Sparkles,
@@ -41,18 +42,24 @@ type LocalProfile = {
 type Holding = {
   id: string;
   name: string;
-  type: "SIP" | "FD" | "Stock" | "Mutual fund" | "Other";
+  type: string;
   amount: number;
   date: string;
 };
 
 type ChatMessage = { role: "assistant" | "user"; content: string };
-type Quote = { symbol: string; price: number; currency: string; changePercent?: number; annualizedVolatility?: number | null; riskBand?: string | null; riskSamples?: number; updatedAt?: string };
+type Quote = { symbol: string; price: number; currency: string; exchange?: string; changePercent?: number | null; annualizedVolatility?: number | null; riskBand?: string | null; riskSamples?: number; updatedAt?: string | null; source?: string; isLive?: boolean };
+type SymbolResult = { symbol: string; name: string; exchange: string; currency: string };
+type SearchResult = { kind: "quote"; quote: Quote; name: string } | { kind: "answer"; answer: string; liveSearch: boolean; sources?: Array<{ title: string; url: string }> };
+type KpiId = "netWorth" | "invested" | "holdings" | "risk" | "horizon" | "goal";
 
 const PROFILE_KEY = "fincorpus.profile.v1";
 const HOLDINGS_KEY = "fincorpus.holdings.v1";
 const CHAT_KEY = "fincorpus.chat.v1";
 const NET_WORTH_KEY = "fincorpus.networth.v1";
+const KPI_ORDER_KEY = "fincorpus.kpi-order.v1";
+const KPI_VISIBLE_KEY = "fincorpus.kpi-visible.v1";
+const RETIREMENT_KEY = "fincorpus.retirement.v1";
 const categories = ["Stocks", "SIP funds", "Fixed deposits", "Gold"] as const;
 const riskMix: Record<string, number[]> = {
   Low: [20, 25, 45, 10],
@@ -93,6 +100,32 @@ function elapsedLabel(date: string) {
   return `${months} ${months === 1 ? "month" : "months"}`;
 }
 
+function futureValue(monthly: number, starting: number, annualRate: number, years: number) {
+  const months = Math.max(0, Math.round(years * 12));
+  const monthlyRate = annualRate / 12;
+  if (!months) return starting;
+  if (!monthlyRate) return starting + monthly * months;
+  const factor = (1 + monthlyRate) ** months;
+  return starting * factor + monthly * ((factor - 1) / monthlyRate);
+}
+
+function monthlyPayout(corpus: number, annualRate: number, years: number) {
+  const months = Math.max(1, Math.round(years * 12));
+  const monthlyRate = annualRate / 12;
+  if (!monthlyRate) return corpus / months;
+  const factor = (1 + monthlyRate) ** months;
+  return corpus * monthlyRate * factor / (factor - 1);
+}
+
+const kpiLabels: Record<KpiId, string> = {
+  netWorth: "Net worth",
+  invested: "Invested tracked",
+  holdings: "Holdings count",
+  risk: "Risk comfort",
+  horizon: "Time horizon",
+  goal: "Goal target",
+};
+
 export default function Home() {
   const [profile, setProfile] = useState<LocalProfile | null>(null);
   const [hydrated, setHydrated] = useState(false);
@@ -102,6 +135,21 @@ export default function Home() {
   const [messages, setMessages] = useState<ChatMessage[]>([]);
   const [quotes, setQuotes] = useState<Record<string, Quote | null>>({ GOLD: null, RELIANCE: null, TCS: null });
   const [quoteState, setQuoteState] = useState("Loading market feeds");
+  const [marketQuery, setMarketQuery] = useState("");
+  const [marketSearchLoading, setMarketSearchLoading] = useState(false);
+  const [marketSearchError, setMarketSearchError] = useState("");
+  const [marketResults, setMarketResults] = useState<SearchResult[]>([]);
+  const [kpiOrder, setKpiOrder] = useState<KpiId[]>(["netWorth", "invested", "risk", "holdings", "horizon", "goal"]);
+  const [visibleKpis, setVisibleKpis] = useState<KpiId[]>(["netWorth", "invested", "risk"]);
+  const [kpiToAdd, setKpiToAdd] = useState<KpiId>("holdings");
+  const [draggedKpi, setDraggedKpi] = useState<KpiId | null>(null);
+  const [reportKind, setReportKind] = useState("Portfolio snapshot");
+  const [report, setReport] = useState("");
+  const [reportLoading, setReportLoading] = useState(false);
+  const [monthlySalary, setMonthlySalary] = useState(0);
+  const [monthlyInvestment, setMonthlyInvestment] = useState(0);
+  const [retirementYears, setRetirementYears] = useState(15);
+  const [payoutYears, setPayoutYears] = useState(25);
   const [modal, setModal] = useState<"signup" | "login" | "networth" | null>(null);
   const [mobileNav, setMobileNav] = useState(false);
   const [authError, setAuthError] = useState("");
@@ -121,11 +169,23 @@ export default function Home() {
       const savedHoldings = localStorage.getItem(HOLDINGS_KEY);
       const savedChat = localStorage.getItem(CHAT_KEY);
       const savedNetWorth = localStorage.getItem(NET_WORTH_KEY);
+      const savedKpiOrder = localStorage.getItem(KPI_ORDER_KEY);
+      const savedVisibleKpis = localStorage.getItem(KPI_VISIBLE_KEY);
+      const savedRetirement = localStorage.getItem(RETIREMENT_KEY);
       startTransition(() => {
         if (savedProfile) setProfile(JSON.parse(savedProfile) as LocalProfile);
         if (savedHoldings) setHoldings(JSON.parse(savedHoldings) as Holding[]);
         if (savedChat) setMessages(JSON.parse(savedChat) as ChatMessage[]);
         if (savedNetWorth) setLocalNetWorth(Math.max(0, Number(savedNetWorth)));
+        if (savedKpiOrder) setKpiOrder(JSON.parse(savedKpiOrder) as KpiId[]);
+        if (savedVisibleKpis) setVisibleKpis(JSON.parse(savedVisibleKpis) as KpiId[]);
+        if (savedRetirement) {
+          const retirement = JSON.parse(savedRetirement) as { monthlySalary?: number; monthlyInvestment?: number; retirementYears?: number; payoutYears?: number };
+          setMonthlySalary(Math.max(0, retirement.monthlySalary ?? 0));
+          setMonthlyInvestment(Math.max(0, retirement.monthlyInvestment ?? 0));
+          setRetirementYears(Math.max(1, retirement.retirementYears ?? 15));
+          setPayoutYears(Math.max(1, retirement.payoutYears ?? 25));
+        }
         setAuthenticated(sessionStorage.getItem("fincorpus.session") === "1");
         setHydrated(true);
       });
@@ -138,12 +198,12 @@ export default function Home() {
 
     Promise.all([
       fetch("/api/markets?type=gold").then((response) => response.ok ? response.json() : null),
-      fetch("/api/markets?type=stock&symbol=RELIANCE").then((response) => response.ok ? response.json() : null),
-      fetch("/api/markets?type=stock&symbol=TCS").then((response) => response.ok ? response.json() : null),
+      fetch("/api/markets?type=stock&symbol=RELIANCE&exchange=NSE").then((response) => response.ok ? response.json() : null),
+      fetch("/api/markets?type=stock&symbol=TCS&exchange=NSE").then((response) => response.ok ? response.json() : null),
     ])
       .then(([gold, reliance, tcs]) => {
         setQuotes({ GOLD: gold, RELIANCE: reliance, TCS: tcs });
-        setQuoteState(gold || reliance || tcs ? "Market data refreshed" : "Market feeds need setup");
+        setQuoteState([gold, reliance, tcs].some((quote) => quote?.isLive) ? "Live provider quotes" : "Live feeds unavailable");
       })
       .catch(() => setQuoteState("Market feeds unavailable"));
   }, []);
@@ -164,9 +224,23 @@ export default function Home() {
     if (hydrated) localStorage.setItem(CHAT_KEY, JSON.stringify(messages));
   }, [hydrated, messages]);
 
+  useEffect(() => {
+    if (hydrated) {
+      localStorage.setItem(KPI_ORDER_KEY, JSON.stringify(kpiOrder));
+      localStorage.setItem(KPI_VISIBLE_KEY, JSON.stringify(visibleKpis));
+      localStorage.setItem(RETIREMENT_KEY, JSON.stringify({ monthlySalary, monthlyInvestment, retirementYears, payoutYears }));
+    }
+  }, [hydrated, kpiOrder, visibleKpis, monthlySalary, monthlyInvestment, retirementYears, payoutYears]);
+
   const allocation = riskMix[risk] ?? riskMix.Moderate;
   const invested = useMemo(() => holdings.reduce((total, holding) => total + holding.amount, 0), [holdings]);
   const totalValue = profile?.netWorth ?? localNetWorth;
+  const retirementScenarios = [6, 8, 10].map((rate) => {
+    const corpus = futureValue(monthlyInvestment, invested, rate / 100, retirementYears);
+    const payout = monthlyPayout(corpus, rate / 100, payoutYears);
+    const inTodayMoney = payout / (1.05 ** retirementYears);
+    return { rate, corpus, payout, inTodayMoney };
+  });
   const initials = profile?.name.split(/\s+/).map((part) => part[0]).slice(0, 2).join("").toUpperCase() || "FC";
 
   async function handleAuth(event: FormEvent<HTMLFormElement>) {
@@ -258,6 +332,20 @@ export default function Home() {
     const nextMessages = [...messages, { role: "user" as const, content: question }];
     setMessages(nextMessages);
     setChatInput("");
+
+    const kpiAliases: Record<string, KpiId> = {
+      "net worth": "netWorth", portfolio: "netWorth", invested: "invested", investment: "invested",
+      holdings: "holdings", risk: "risk", horizon: "horizon", "time horizon": "horizon", goal: "goal",
+    };
+    const kpiMatch = Object.keys(kpiAliases).find((label) => new RegExp(`\\b${label.replace(" ", "\\s+")}\\b`, "i").test(question));
+    if (kpiMatch && /\b(show|add|pin|display|hide|remove)\b/i.test(question) && /\b(dashboard|kpi|tile|card|show|hide|add|pin|display|remove)\b/i.test(question)) {
+      const kpi = kpiAliases[kpiMatch];
+      const shouldShow = !/\b(hide|remove)\b/i.test(question);
+      setVisibleKpis((current) => shouldShow ? current.includes(kpi) ? current : [...current, kpi] : current.filter((item) => item !== kpi));
+      setMessages([...nextMessages, { role: "assistant", content: `${shouldShow ? "Added" : "Removed"} ${kpiLabels[kpi]} ${shouldShow ? "to" : "from"} your dashboard. You can drag its tile or use the arrow controls to reorder KPIs.` }]);
+      return;
+    }
+
     setChatLoading(true);
     try {
       const context = {
@@ -267,12 +355,16 @@ export default function Home() {
         horizon,
         goalAmount,
         goalMonths,
+        monthlySalary,
+        monthlyInvestment,
+        retirementYears,
+        payoutYears,
         holdings: holdings.map(({ name, type, amount, date }) => ({ name, type, amount, date })),
       };
       const response = await fetch("/api/assistant", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ task: "chat", question, context }),
+        body: JSON.stringify({ task: "chat", question, context, history: messages.slice(-8) }),
       });
       const data = await response.json();
       if (!response.ok) throw new Error(data.error ?? "AI service is not configured yet.");
@@ -294,10 +386,151 @@ export default function Home() {
       setHoldingError("Add an investment name, a positive amount, and a date.");
       return;
     }
-    const type = String(form.get("type") ?? "Other") as Holding["type"];
+    const type = String(form.get("type") ?? "Other").trim().slice(0, 30) || "Other";
     setHoldings([{ id: crypto.randomUUID(), name, amount, date, type }, ...holdings]);
     setHoldingError("");
     event.currentTarget.reset();
+  }
+
+  async function searchWithAI(searchText = marketQuery) {
+    const question = searchText.trim();
+    if (!question) return;
+    setMarketSearchLoading(true);
+    setMarketSearchError("");
+    setMarketResults([]);
+    try {
+      const response = await fetch("/api/assistant", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ task: "search", question, context: { asOf: new Date().toISOString(), netWorth: totalValue } }),
+      });
+      const data = await response.json();
+      if (!response.ok) throw new Error(data.error ?? "Search is unavailable.");
+      setMarketResults([{ kind: "answer", answer: data.answer, liveSearch: Boolean(data.liveSearch), sources: data.sources }]);
+    } catch (error) {
+      setMarketSearchError(error instanceof Error ? error.message : "Search is temporarily unavailable.");
+    } finally {
+      setMarketSearchLoading(false);
+    }
+  }
+
+  async function searchMarkets(event: FormEvent<HTMLFormElement>) {
+    event.preventDefault();
+    const query = marketQuery.trim();
+    if (!query || marketSearchLoading) return;
+    if (/\b(gold|sona|xau)\b/i.test(query)) {
+      setMarketSearchLoading(true);
+      setMarketSearchError("");
+      setMarketResults([]);
+      try {
+        const response = await fetch("/api/markets?type=gold");
+        const quote = await response.json();
+        if (!response.ok) throw new Error(quote.error ?? "Live gold price is unavailable.");
+        setMarketResults([{ kind: "quote", quote, name: "Gold spot estimate · INR per 10g" }]);
+      } catch (error) {
+        setMarketSearchError(error instanceof Error ? error.message : "Live gold price is unavailable.");
+      } finally {
+        setMarketSearchLoading(false);
+      }
+      return;
+    }
+
+    if (/\b(fd|fixed deposit|mutual fund|sip|interest rate|bank rate|roi|retirement|news|inflation)\b/i.test(query)) {
+      await searchWithAI(query);
+      return;
+    }
+
+    setMarketSearchLoading(true);
+    setMarketSearchError("");
+    setMarketResults([]);
+    try {
+      const response = await fetch(`/api/markets?type=search&query=${encodeURIComponent(query)}`);
+      const data = await response.json();
+      if (!response.ok) throw new Error(data.error ?? "Symbol search is unavailable.");
+      const symbols = (data.results ?? []) as SymbolResult[];
+      if (symbols.length === 0) {
+        await searchWithAI(query);
+        return;
+      }
+      const quotesForSymbols = await Promise.all(symbols.slice(0, 4).map(async (item) => {
+        const quoteResponse = await fetch(`/api/markets?type=stock&symbol=${encodeURIComponent(item.symbol)}&exchange=${encodeURIComponent(item.exchange)}`);
+        const quote = await quoteResponse.json();
+        return quoteResponse.ok ? { kind: "quote" as const, quote: quote as Quote, name: item.name } : null;
+      }));
+      const availableQuotes = quotesForSymbols.filter((result): result is { kind: "quote"; quote: Quote; name: string } => result !== null);
+      setMarketResults(availableQuotes);
+      if (availableQuotes.length === 0) setMarketSearchError("No live quote is available for these matches. Check the ticker, provider permissions, and free-tier limits.");
+    } catch (error) {
+      setMarketSearchError(error instanceof Error ? error.message : "Live market search is unavailable.");
+    } finally {
+      setMarketSearchLoading(false);
+    }
+  }
+
+  async function generateReport() {
+    setReportLoading(true);
+    setReport("");
+    try {
+      const response = await fetch("/api/assistant", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          task: "report",
+          question: reportKind,
+          context: {
+            netWorth: totalValue,
+            invested,
+            goalAmount,
+            goalMonths,
+            horizon,
+            risk,
+            monthlySalary,
+            monthlyInvestment,
+            retirementYears,
+            payoutYears,
+            holdings: holdings.map(({ name, type, amount, date }) => ({ name, type, amount, date })),
+          },
+        }),
+      });
+      const data = await response.json();
+      if (!response.ok) throw new Error(data.error ?? "Report generation is unavailable.");
+      setReport(data.answer);
+    } catch (error) {
+      setReport(error instanceof Error ? error.message : "Could not generate the report.");
+    } finally {
+      setReportLoading(false);
+    }
+  }
+
+  function reorderKpi(target: KpiId) {
+    if (!draggedKpi || draggedKpi === target) return;
+    const nextOrder = [...kpiOrder];
+    const fromIndex = nextOrder.indexOf(draggedKpi);
+    const targetIndex = nextOrder.indexOf(target);
+    nextOrder.splice(fromIndex, 1);
+    nextOrder.splice(targetIndex, 0, draggedKpi);
+    setKpiOrder(nextOrder);
+    setDraggedKpi(null);
+  }
+
+  function moveKpi(id: KpiId, direction: -1 | 1) {
+    const currentIndex = kpiOrder.indexOf(id);
+    const targetIndex = currentIndex + direction;
+    if (targetIndex < 0 || targetIndex >= kpiOrder.length) return;
+    const nextOrder = [...kpiOrder];
+    [nextOrder[currentIndex], nextOrder[targetIndex]] = [nextOrder[targetIndex], nextOrder[currentIndex]];
+    setKpiOrder(nextOrder);
+  }
+
+  function kpiValue(id: KpiId) {
+    switch (id) {
+      case "netWorth": return { value: money(totalValue), detail: "Local net-worth figure" };
+      case "invested": return { value: money(invested), detail: `${holdings.length} tracked entries` };
+      case "holdings": return { value: String(holdings.length), detail: "Tracked investments" };
+      case "risk": return { value: risk, detail: "Self-reported preference" };
+      case "horizon": return { value: horizon.split(" · ")[0], detail: horizon };
+      case "goal": return { value: money(goalAmount), detail: `Target in ${goalMonths} months` };
+    }
   }
 
   function signOut() {
@@ -335,7 +568,7 @@ export default function Home() {
           <button className="icon-button mobile-menu" aria-label="Open navigation" onClick={() => setMobileNav(!mobileNav)}><Menu size={20} /></button>
           <div className="crumb"><span>Workspace</span><span className="crumb-slash">/</span><strong>Overview</strong></div>
           <div className="top-actions">
-            <span className="market-status"><i className={quoteState === "Market data refreshed" ? "status-dot live" : "status-dot"} />{quoteState}</span>
+            <span className="market-status"><i className={quoteState === "Live provider quotes" ? "status-dot live" : "status-dot"} />{quoteState}</span>
             <button className="icon-button notification-button" aria-label="Notifications"><Bell size={18} /></button>
             {authenticated ? <button className="avatar avatar-button" aria-label="Sign out" title="Sign out" onClick={signOut}>{initials}</button> : <button className="button button-small button-outline" onClick={() => setModal(profile ? "login" : "signup")}>{profile ? "Sign in" : "Create profile"}</button>}
           </div>
@@ -349,6 +582,20 @@ export default function Home() {
               <p className="welcome-subtitle">A clear view of what you have, where it could go, and what matters next.</p>
             </div>
             <div className="date-chip"><CalendarDays size={15} /><span>{new Date().toLocaleDateString("en-IN", { weekday: "short", day: "numeric", month: "short", year: "numeric" })}</span></div>
+          </section>
+
+          <section className="market-search-section" aria-label="Search investments and financial information">
+            <form className="market-search-form" onSubmit={searchMarkets}>
+              <Search size={18} />
+              <input value={marketQuery} onChange={(event) => setMarketQuery(event.target.value)} placeholder="Search a stock, gold, FD rates, funds, or ask AI..." aria-label="Search stocks, gold, rates, funds, or ask AI" maxLength={120} />
+              <button className="button button-dark search-button" type="submit" disabled={marketSearchLoading || !marketQuery.trim()}>{marketSearchLoading ? "Searching..." : "Search markets"}</button>
+              <button className="button button-primary search-ai-button" type="button" disabled={marketSearchLoading || !marketQuery.trim()} onClick={() => void searchWithAI()}><Sparkles size={15} />Ask AI</button>
+            </form>
+            <div className="search-hints"><span>Try</span>{["Gold price today", "HDFC FD interest rates", "Mutual fund performance"].map((example) => <button key={example} onClick={() => { setMarketQuery(example); void searchWithAI(example); }}>{example}<ArrowUpRight size={11} /></button>)}</div>
+            {(marketSearchError || marketResults.length > 0) && <div className="search-results" aria-live="polite">
+              {marketSearchError && <p className="search-error">{marketSearchError}</p>}
+              {marketResults.map((result, index) => result.kind === "quote" ? <article className="search-quote-result" key={`${result.quote.symbol}-${index}`}><span className="search-result-icon"><TrendingUp size={16} /></span><span className="search-result-copy"><strong>{result.name}</strong><small>{result.quote.symbol} · {result.quote.exchange || "Spot"} · {result.quote.source}{result.quote.updatedAt ? ` · ${result.quote.updatedAt}` : ""}</small></span><strong className="search-result-price">{money(result.quote.price)}<small>{result.quote.changePercent == null ? result.quote.currency : `${result.quote.changePercent >= 0 ? "+" : ""}${result.quote.changePercent.toFixed(2)}%`}</small></strong></article> : <article className="search-ai-result" key={`answer-${index}`}><div className="result-title"><Sparkles size={15} />{result.liveSearch ? "AI web research · verify source dates" : "AI search status"}</div><p>{result.answer}</p>{result.sources?.length ? <div className="source-links"><strong>Sources</strong>{result.sources.map((source) => <a href={source.url} key={source.url} target="_blank" rel="noreferrer">{source.title}<ArrowUpRight size={12} /></a>)}</div> : null}</article>)}
+            </div>}
           </section>
 
           <section className="hero-grid" aria-label="Portfolio overview">
@@ -368,18 +615,20 @@ export default function Home() {
 
             <div className="market-panel">
               <div className="section-heading market-heading"><div><p className="eyebrow small-eyebrow">MARKET PULSE</p><h2>Prices worth watching</h2></div><button className="icon-button refresh-button" title="Refresh prices" aria-label="Refresh prices" onClick={() => window.location.reload()}><TrendingUp size={17} /></button></div>
-              <div className="quote-row"><span className="quote-symbol gold-symbol"><Coins size={17} /></span><span className="quote-name"><strong>Gold · 24K</strong><small>Spot · INR per 10g</small></span><span className="quote-price">{quotes.GOLD ? money(quotes.GOLD.price) : "—"}<small>{quotes.GOLD ? "provider quote" : "feed unavailable"}</small></span></div>
-              <div className="quote-row"><span className="quote-symbol"><span>R</span></span><span className="quote-name"><strong>Reliance</strong><small>NSE · INR</small></span><span className="quote-price">{quotes.RELIANCE ? money(quotes.RELIANCE.price) : "—"}<small>{quotes.RELIANCE?.changePercent != null ? `${quotes.RELIANCE.changePercent >= 0 ? "+" : ""}${quotes.RELIANCE.changePercent.toFixed(2)}% today` : "quote unavailable"}</small></span></div>
-              <div className="quote-row"><span className="quote-symbol"><span>T</span></span><span className="quote-name"><strong>TCS</strong><small>NSE · INR</small></span><span className="quote-price">{quotes.TCS ? money(quotes.TCS.price) : "—"}<small>{quotes.TCS?.changePercent != null ? `${quotes.TCS.changePercent >= 0 ? "+" : ""}${quotes.TCS.changePercent.toFixed(2)}% today` : "quote unavailable"}</small></span></div>
+              <div className="quote-row"><span className="quote-symbol gold-symbol"><Coins size={17} /></span><span className="quote-name"><strong>Gold · 24K</strong><small>Spot conversion · INR per 10g</small></span><span className="quote-price">{quotes.GOLD?.isLive ? money(quotes.GOLD.price) : "—"}<small>{quotes.GOLD?.isLive ? "live provider quote" : "live quote unavailable"}</small></span></div>
+              <div className="quote-row"><span className="quote-symbol"><span>R</span></span><span className="quote-name"><strong>Reliance</strong><small>NSE · INR</small></span><span className="quote-price">{quotes.RELIANCE?.isLive ? money(quotes.RELIANCE.price) : "—"}<small>{quotes.RELIANCE?.isLive && quotes.RELIANCE.changePercent != null ? `${quotes.RELIANCE.changePercent >= 0 ? "+" : ""}${quotes.RELIANCE.changePercent.toFixed(2)}% today` : "live quote unavailable"}</small></span></div>
+              <div className="quote-row"><span className="quote-symbol"><span>T</span></span><span className="quote-name"><strong>TCS</strong><small>NSE · INR</small></span><span className="quote-price">{quotes.TCS?.isLive ? money(quotes.TCS.price) : "—"}<small>{quotes.TCS?.isLive && quotes.TCS.changePercent != null ? `${quotes.TCS.changePercent >= 0 ? "+" : ""}${quotes.TCS.changePercent.toFixed(2)}% today` : "live quote unavailable"}</small></span></div>
               <div className="stock-risk"><div className="stock-risk-heading"><strong>30-day stock risk behavior</strong><span>Annualized volatility</span></div>{(["RELIANCE", "TCS"] as const).map((symbol) => { const quote = quotes[symbol]; return <div className="stock-risk-row" key={symbol}><span>{symbol}</span><div className="stock-risk-track"><i style={{ width: `${Math.min(quote?.annualizedVolatility ?? 0, 80) / 80 * 100}%` }} /></div><strong>{quote?.annualizedVolatility != null ? `${quote.annualizedVolatility.toFixed(1)}% · ${quote.riskBand} · ${quote.riskSamples} sessions` : "History unavailable"}</strong></div>; })}</div>
               <p className="market-footnote">Gold is converted global spot, excluding local premiums and taxes. Stock volatility uses recent closes and is not a forecast.</p>
             </div>
           </section>
 
-          <section className="metrics-row" aria-label="Portfolio indicators">
-            <article className="metric-card"><div className="metric-label"><span>INVESTED TRACKED</span><span className="metric-icon mint"><BadgeIndianRupee size={16} /></span></div><strong>{money(invested)}</strong><small>Across {holdings.length} recorded {holdings.length === 1 ? "investment" : "investments"}</small></article>
-            <article className="metric-card"><div className="metric-label"><span>YOUR TIME HORIZON</span><span className="metric-icon blue"><Clock3 size={16} /></span></div><strong className="metric-word">{horizon.startsWith("Long") ? "Long term" : horizon.startsWith("Medium") ? "Medium term" : "Short term"}</strong><small>Set in your plan preferences</small></article>
-            <article className="metric-card"><div className="metric-label"><span>RISK COMFORT</span><span className="metric-icon amber"><BarChart3 size={16} /></span></div><strong className="metric-word">{risk}</strong><small>Self-reported · not a score</small></article>
+          <section aria-label="Customizable portfolio indicators">
+            <div className="kpi-controls"><span className="eyebrow small-eyebrow">YOUR DASHBOARD</span><label className="kpi-add-control"><span className="visually-hidden">Choose a KPI</span><select value={kpiToAdd} onChange={(event) => setKpiToAdd(event.target.value as KpiId)}>{kpiOrder.filter((id) => !visibleKpis.includes(id)).map((id) => <option key={id} value={id}>{kpiLabels[id]}</option>)}</select><button className="button button-small button-outline" onClick={() => setVisibleKpis([...visibleKpis, kpiToAdd])} disabled={visibleKpis.length >= kpiOrder.length || visibleKpis.includes(kpiToAdd)}><Plus size={13} /> Add KPI</button></label></div>
+            <div className="metrics-row">{kpiOrder.filter((id) => visibleKpis.includes(id)).map((id) => {
+              const item = kpiValue(id);
+              return <article className="metric-card draggable-kpi" key={id} draggable onDragStart={() => setDraggedKpi(id)} onDragOver={(event) => event.preventDefault()} onDrop={() => reorderKpi(id)} onDragEnd={() => setDraggedKpi(null)}><div className="metric-label"><span>{kpiLabels[id].toUpperCase()}</span><span className="metric-actions"><GripVertical size={14} aria-hidden="true" /><button className="kpi-move" title="Move KPI earlier" aria-label={`Move ${kpiLabels[id]} earlier`} onClick={() => moveKpi(id, -1)}><ChevronUp size={13} /></button><button className="kpi-move" title="Move KPI later" aria-label={`Move ${kpiLabels[id]} later`} onClick={() => moveKpi(id, 1)}><ChevronDown size={13} /></button><button className="kpi-remove" title={`Remove ${kpiLabels[id]}`} aria-label={`Remove ${kpiLabels[id]} KPI`} onClick={() => setVisibleKpis(visibleKpis.filter((itemId) => itemId !== id))}><X size={13} /></button></span></div><strong className={id === "risk" || id === "horizon" || id === "holdings" ? "metric-word" : ""}>{item.value}</strong><small>{item.detail}</small></article>;
+            })}</div>
           </section>
 
           <div className="section-title-row" id="plan"><div><p className="eyebrow small-eyebrow">YOUR NEXT MOVE</p><h2>Build a plan around your life</h2></div><span className="local-tag"><LockKeyhole size={13} /> Your figures stay local</span></div>
@@ -406,6 +655,28 @@ export default function Home() {
             </aside>
           </section>
 
+          <section className="retirement-section" id="retirement">
+            <div className="section-title-row"><div><p className="eyebrow small-eyebrow">LONG-RANGE SCENARIOS</p><h2>Retirement income, explored</h2></div><span className="local-tag"><LockKeyhole size={13} /> Inputs saved on this device</span></div>
+            <div className="retirement-grid">
+              <form className="retirement-form surface" onSubmit={(event) => event.preventDefault()}>
+                <div className="surface-title"><span className="surface-icon green"><CalendarDays size={17} /></span><div><h3>Starting assumptions</h3><p>Illustrative math, not a promised return.</p></div></div>
+                <div className="form-grid">
+                  <label className="field"><span>Monthly take-home salary <small>INR</small></span><input type="number" min="0" step="1000" value={monthlySalary || ""} placeholder="e.g. 80,000" onChange={(event) => setMonthlySalary(Number(event.target.value))} /></label>
+                  <label className="field"><span>Invest each month <small>INR</small></span><input type="number" min="0" step="500" value={monthlyInvestment || ""} placeholder="e.g. 15,000" onChange={(event) => setMonthlyInvestment(Number(event.target.value))} /></label>
+                  <label className="field"><span>Years until retirement</span><input type="number" min="1" max="60" value={retirementYears} onChange={(event) => setRetirementYears(Math.max(1, Math.min(60, Number(event.target.value))))} /></label>
+                  <label className="field"><span>Payout duration <small>years</small></span><input type="number" min="1" max="60" value={payoutYears} onChange={(event) => setPayoutYears(Math.max(1, Math.min(60, Number(event.target.value))))} /></label>
+                </div>
+                <p className="retirement-note">Starting corpus uses your tracked investments ({money(invested)}). The scenarios assume constant nominal returns of 6%, 8%, or 10%, 5% inflation, and a level payout over the chosen duration. Real results will vary.</p>
+              </form>
+                <div className="retirement-results surface"><div className="holdings-list-heading"><div><h3>Estimated monthly payout</h3><p>Shown in future rupees and today&apos;s purchasing power</p></div><span className="count-badge"><TrendingUp size={14} /></span></div>{retirementScenarios.map((scenario) => <div className="scenario-row" key={scenario.rate}><span className="scenario-rate">{scenario.rate}%<small>illustrative annual return</small></span><span><strong>{money(scenario.payout)} / mo</strong><small>future value · corpus {money(scenario.corpus)}</small></span><strong className="scenario-today">{money(scenario.inTodayMoney)}<small>today&apos;s rupees</small></strong></div>)}<button className="text-action retirement-ask" onClick={() => { setChatInput("Help me understand my retirement scenarios. Ask any follow-up questions you need."); document.getElementById("assistant")?.scrollIntoView({ behavior: "smooth" }); }}><MessageCircle size={14} /> Ask AI about retirement</button></div>
+            </div>
+          </section>
+
+          <section className="reports-section" id="reports">
+            <div className="section-title-row"><div><p className="eyebrow small-eyebrow">A CLEARER VIEW</p><h2>Financial reports</h2></div><span className="local-tag"><FileText size={13} /> Generated on request</span></div>
+            <div className="report-builder surface"><div className="report-controls"><label className="field"><span>Report type</span><select value={reportKind} onChange={(event) => setReportKind(event.target.value)}><option>Portfolio snapshot</option><option>Risk and allocation review</option><option>Goal progress and savings gap</option><option>Retirement income scenarios</option><option>Holdings summary</option></select></label><button className="button button-primary" onClick={generateReport} disabled={reportLoading}><FileText size={15} />{reportLoading ? "Preparing report..." : "Generate report"}</button></div>{report ? <article className="report-output" aria-live="polite"><div className="result-title"><Sparkles size={15} />{reportKind}</div><p>{report}</p></article> : <p className="report-empty">Choose a report to summarize your locally tracked figures. Live rate or market research is only included when separately retrieved and verified.</p>}</div>
+          </section>
+
           <section className="holdings-section" id="holdings">
             <div className="section-title-row holdings-title"><div><p className="eyebrow small-eyebrow">KEEP THE DETAILS TOGETHER</p><h2>Investment tracker</h2></div><span className="local-tag"><LockKeyhole size={13} /> Saved on this device</span></div>
             <div className="holdings-grid">
@@ -413,7 +684,7 @@ export default function Home() {
                 <div className="surface-title"><span className="surface-icon green"><Plus size={17} /></span><div><h3>Add an investment</h3><p>Track SIPs, FDs, stocks, or anything else.</p></div></div>
                 <label className="field"><span>Investment name</span><input name="holdingName" placeholder="e.g. Monthly index SIP" maxLength={60} /></label>
                 <div className="form-grid holding-form-grid">
-                  <label className="field"><span>Investment type</span><select name="type"><option>SIP</option><option>FD</option><option>Stock</option><option>Mutual fund</option><option>Other</option></select></label>
+                  <label className="field"><span>Investment type</span><input name="type" list="investment-types" placeholder="Any investment type" maxLength={30} defaultValue="SIP" /><datalist id="investment-types"><option value="SIP" /><option value="FD" /><option value="Stock" /><option value="Mutual fund" /><option value="Gold" /><option value="Property" /><option value="Cash" /></datalist></label>
                   <label className="field"><span>Amount <small>INR</small></span><input name="amount" type="number" min="1" step="100" placeholder="25,000" /></label>
                   <label className="field field-full"><span>Investment date</span><input name="date" type="date" max={new Date().toISOString().slice(0, 10)} defaultValue={new Date().toISOString().slice(0, 10)} /></label>
                 </div>
@@ -437,7 +708,7 @@ export default function Home() {
                 {chatLoading && <div className="chat-message assistant"><span className="message-label">FINCORPUS AI</span><p className="thinking">Putting the context together...</p></div>}
               </div>
               <form className="chat-form" onSubmit={sendMessage}><input value={chatInput} onChange={(event) => setChatInput(event.target.value)} placeholder="Ask a question about your plan..." maxLength={1200} aria-label="Ask Fincorpus AI" /><button className="send-button" type="submit" disabled={chatLoading || !chatInput.trim()} aria-label="Send question"><Send size={17} /></button></form>
-              <p className="chat-privacy">When you ask, portfolio amounts, holdings, risk comfort, and goal details are sent to Groq for that request. Chat history is stored only in this browser.</p>
+              <p className="chat-privacy">When you ask, portfolio data and up to 8 recent chat turns are sent to Groq for that request. Chat history is stored only in this browser.</p>
             </div>
           </section>
 
